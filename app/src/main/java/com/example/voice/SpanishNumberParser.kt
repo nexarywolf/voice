@@ -183,14 +183,22 @@ object SpanishNumberParser {
         val detectedNumber = extractNumber(clean)
 
         if (detectedNumber != null) {
-            if (callModeAlwaysIncrement) {
-                // Modo llamada: cualquier número → +1 (no fijar valor)
+            // Comportamiento por defecto (callModeAlwaysIncrement=false):
+            //   "uno" / "1"      → +1
+            //   "80", "150"      → fijar contador a ese valor (SetDirect)
+            //
+            // Comportamiento con callModeAlwaysIncrement=true (modo llamada,
+            // pensado para contar en voz alta "uno, dos, tres" → +1 +1 +1):
+            //   "uno" / "1"      → +1
+            //   "dos", "tres"   → +1 (porque en una llamada estás contando
+            //                          items, no dictando un valor exacto)
+            //   "80", "150"      → fijar contador (números grandes NO se
+            //                          tratan como "+1" — sería un error
+            //                          hacer +1 cuando el usuario dice 80)
+            if (callModeAlwaysIncrement && detectedNumber in 1..10) {
                 return VoiceCommand.Increment(1)
             }
 
-            // Por defecto: "uno" / "1" → incrementa en 1.
-            // Cualquier otro número ("150", "ciento cincuenta", "42")
-            // → fija el contador a ese valor.
             return if (detectedNumber == 1) {
                 VoiceCommand.Increment(1)
             } else {

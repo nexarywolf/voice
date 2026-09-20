@@ -60,7 +60,12 @@ class CounterViewModel(application: Application) : AndroidViewModel(application)
     private val _currentSource = MutableStateFlow("Voz directa")
     val currentSource: StateFlow<String> = _currentSource.asStateFlow()
 
-    private val _callAlwaysIncrement = MutableStateFlow(true)
+    // Por defecto FALSE: cualquier número dicho ("80", "150", "ciento cincuenta")
+    // FIJA el contador a ese valor. Solo cuando el usuario activa el "Modo
+    // llamadas" en la UI, este flag pasa a true para que en llamadas cada
+    // utterancia cuente como "+1" (pensado para contar en voz alta: "uno,
+    // dos, tres" → +1, +1, +1).
+    private val _callAlwaysIncrement = MutableStateFlow(false)
     val callAlwaysIncrement: StateFlow<Boolean> = _callAlwaysIncrement.asStateFlow()
 
     private val _isExporting = MutableStateFlow(false)
