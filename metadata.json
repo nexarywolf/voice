@@ -1,0 +1,6 @@
+{
+  "name": "Contador por Voz",
+  "description": "Contador inteligente por voz offline con Material You 3, reconocimiento continuo durante llamadas y WhatsApp, historial detallado y exportación a CSV.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

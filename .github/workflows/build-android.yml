@@ -1,0 +1,239 @@
+name: Build Android App
+
+# Workflow para compilar la app Android "Contador por Voz".
+# Genera el APK de debug siempre, y el APK + AAB firmados de release
+# si están configurados los secrets de firmado en el repositorio.
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      build_release:
+        description: "Forzar build de release (true/false)"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+# Cancela runs anteriores de la misma rama si llega un nuevo commit.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build APK / AAB
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: read
+
+    # HAS_KEYSTORE se evalúa una sola vez a nivel de job y queda
+    # disponible para los `if:` de cada step (los `env:` del propio
+    # step NO son accesibles desde su propio `if:`).
+    env:
+      HAS_KEYSTORE: ${{ secrets.SIGNING_KEYSTORE != '' }}
+      KEYSTORE_PATH: ${{ github.workspace }}/my-upload-key.jks
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      # AGP 9.x requiere JDK 21 para ejecutar Gradle.
+      - name: Configurar JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      # El runner de ubuntu-latest ya tiene el Android SDK preinstalado
+      # en /usr/local/lib/android/sdk con cmdline-tools. NO usamos
+      # android-actions/setup-android@v3 porque su parámetro `packages`
+      # multi-línea se pasa como un solo nombre de paquete a sdkmanager
+      # (bug conocido en la versión v3 actual). En su lugar, llamamos
+      # a sdkmanager directamente con cada paquete como argumento.
+      - name: Configurar Android SDK (licencias + plataformas)
+        shell: bash
+        run: |
+          set -e
+          : "${ANDROID_HOME:=/usr/local/lib/android/sdk}"
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$ANDROID_HOME/cmdline-tools/bin/sdkmanager"
+          fi
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(command -v sdkmanager)"
+          fi
+          echo "SDKMANAGER=$SDKMANAGER"
+          test -x "$SDKMANAGER" || { echo "sdkmanager no encontrado"; exit 1; }
+
+          echo "Aceptando licencias del SDK..."
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+
+          echo "Instalando platforms;android-36 y build-tools;36.0.0..."
+          "$SDKMANAGER" --install "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Dar permiso de ejecución a gradlew
+        run: chmod +x ./gradlew
+
+      # ============================================================
+      # app/build.gradle.kts configura el buildType `debug` con un
+      # signingConfig custom (`debugConfig`) que apunta a
+      # `${rootDir}/debug.keystore`. Ese archivo está en `.gitignore`
+      # y por tanto NO existe en CI. Sin este paso, el build falla con:
+      #   Keystore file '.../debug.keystore' not found for signing
+      #   config 'debugConfig'.
+      #
+      # Generamos un debug.keystore estándar (mismas credenciales que
+      # usaría Android Studio: storepass=android, alias=androiddebugkey,
+      # keypass=android, RSA 2048, validez 10000 días).
+      # ============================================================
+      - name: Asegurar debug.keystore
+        shell: bash
+        run: |
+          set -e
+          if [ -f debug.keystore ]; then
+            echo "debug.keystore ya existe, no se regenera."
+            exit 0
+          fi
+          # Intento 1: copiar del keystore de debug estándar del SDK.
+          if [ -f "$HOME/.android/debug.keystore" ]; then
+            echo "Copiando keystore de debug estándar (~/.android/debug.keystore)..."
+            cp "$HOME/.android/debug.keystore" debug.keystore
+            ls -la debug.keystore
+            exit 0
+          fi
+          # Intento 2: generarlo con keytool (JDK viene con keytool).
+          echo "Generando debug.keystore nuevo con keytool..."
+          keytool -genkey -v -keystore debug.keystore \
+            -storepass android -alias androiddebugkey -keypass android \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+          ls -la debug.keystore
+
+      # ============================================================
+      # El plugin `secrets-gradle-plugin` (configurado en
+      # app/build.gradle.kts con `defaultPropertiesFileName = ".env.example"`)
+      # REQUIERE que `.env.example` exista en la raíz del proyecto. Si el
+      # repo no lo tiene commiteado, el build falla con
+      # `FileNotFoundException: .env.example`.
+      #
+      # Aquí lo creamos con un placeholder si falta, y a partir de él
+      # generamos `.env` (que es el `propertiesFileName` que el plugin
+      # inyecta en BuildConfig).
+      # ============================================================
+      - name: Asegurar .env y .env.example
+        shell: bash
+        run: |
+          set -e
+          if [ ! -f .env.example ]; then
+            echo "Creando .env.example con placeholder (no estaba en el repo)..."
+            cat > .env.example <<'ENVEOF'
+          # GEMINI_API_KEY: Required for Gemini AI API calls.
+          # This is a placeholder key.
+          # AI Studio automatically injects this at runtime from user secrets.
+          # Users configure this via the Secrets panel in the AI Studio UI.
+          # IMPORTANT: Uncomment the line below if your app uses the Gemini API.
+          # If left commented out, the key will NOT be packaged in the APK.
+          # GEMINI_API_KEY=MY_GEMINI_API_KEY
+          ENVEOF
+          fi
+          # .env es opcional para el plugin, pero lo creamos igual para
+          # que el build sea reproducible.
+          [ -f .env ] || cp .env.example .env
+          echo "---- .env.example ----"
+          cat .env.example
+
+      # ============================================================
+      # Firmado de release: opcional.
+      #
+      # Si NO defines los secrets de firmado, el job de release se salta
+      # y solo se compila el APK de debug.
+      #
+      # Para habilitar el release firmado, define estos secrets en
+      # Settings → Secrets and variables → Actions:
+      #   SIGNING_KEYSTORE   → keystore .jks codificado en base64
+      #   KEYSTORE_PASSWORD  → contraseña del keystore (STORE_PASSWORD)
+      #   KEY_PASSWORD       → contraseña de la clave
+      #
+      # IMPORTANTE: tu keystore debe contener una clave con alias "upload"
+      # (es el alias hardcoded en app/build.gradle.kts).
+      #
+      # Para codificar tu keystore en base64 localmente:
+      #   base64 -i my-upload-key.jks | pbcopy          # macOS
+      #   base64 -w 0 my-upload-key.jks > keystore.b64   # Linux
+      # ============================================================
+      - name: Decodificar keystore de release
+        if: env.HAS_KEYSTORE == 'true'
+        env:
+          SIGNING_KEYSTORE: ${{ secrets.SIGNING_KEYSTORE }}
+        run: |
+          echo "$SIGNING_KEYSTORE" | base64 -d > "$KEYSTORE_PATH"
+          echo "Keystore de release decodificado correctamente."
+
+      # ============================================================
+      # Build de DEBUG (siempre se ejecuta)
+      # ============================================================
+      - name: Compilar APK de Debug
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Subir APK de Debug como artefacto
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-debug
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: warn
+          retention-days: 14
+
+      # ============================================================
+      # Build de RELEASE (solo si hay keystore)
+      # ============================================================
+      - name: Compilar APK + AAB de Release firmado
+        if: env.HAS_KEYSTORE == 'true'
+        env:
+          # La configuración de firmado en app/build.gradle.kts usa:
+          #   KEYSTORE_PATH, STORE_PASSWORD, KEY_PASSWORD (env vars)
+          # y un alias HARDCODED = "upload". Tu keystore debe contener
+          # una clave con alias "upload".
+          STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          ./gradlew assembleRelease --no-daemon --stacktrace
+          ./gradlew bundleRelease --no-daemon --stacktrace
+
+      - name: Subir APK de Release como artefacto
+        if: env.HAS_KEYSTORE == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-release
+          path: |
+            app/build/outputs/apk/release/*.apk
+            app/build/outputs/mapping/release/mapping.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Subir AAB de Release como artefacto
+        if: env.HAS_KEYSTORE == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: aab-release
+          path: app/build/outputs/bundle/release/*.aab
+          if-no-files-found: warn
+          retention-days: 30
+
+      # Limpia keystores temporales y .env del runner.
+      - name: Limpiar archivos temporales
+        if: always()
+        run: |
+          rm -f "$KEYSTORE_PATH"
+          rm -f "${{ github.workspace }}/.env"
+          rm -f "${{ github.workspace }}/.env.example"
+          rm -f "${{ github.workspace }}/debug.keystore"
