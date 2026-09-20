@@ -6,6 +6,7 @@ import android.content.Intent
 import android.os.Build
 import android.os.VibrationEffect
 import android.os.Vibrator
+import android.provider.Settings
 import android.widget.Toast
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -14,6 +15,7 @@ import com.example.data.repository.CounterRepository
 import com.example.service.VoiceCounterService
 import com.example.voice.SpanishNumberParser
 import com.example.voice.VoiceCommand
+import com.example.voice.VoiceDiagnostic
 import com.example.voice.VoiceRecognitionManager
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -63,6 +65,10 @@ class CounterViewModel(application: Application) : AndroidViewModel(application)
 
     private val _isExporting = MutableStateFlow(false)
     val isExporting: StateFlow<Boolean> = _isExporting.asStateFlow()
+
+    // Estado "vacío" por defecto; se rellena en init{} cuando se crea el manager.
+    private val _voiceDiagnostic = MutableStateFlow(VoiceDiagnostic())
+    val voiceDiagnostic: StateFlow<VoiceDiagnostic> = _voiceDiagnostic.asStateFlow()
 
     // History flows
     val recentHistory: StateFlow<List<InteractionEntry>> = repository.recentInteractions
@@ -119,11 +125,76 @@ class CounterViewModel(application: Application) : AndroidViewModel(application)
                 }
             }
         }
+
+        // Reenviar el diagnóstico del manager a nuestro StateFlow para la UI.
+        viewModelScope.launch {
+            localVoiceManager?.diagnostic?.collect { diag ->
+                _voiceDiagnostic.value = diag
+            }
+        }
     }
 
     fun setCallAlwaysIncrement(value: Boolean) {
         _callAlwaysIncrement.value = value
         localVoiceManager?.setCallModeSettings(value)
+    }
+
+    /**
+     * Abre la pantalla de Configuración → Voz e idiomas del sistema,
+     * donde el usuario puede descargar el paquete de español offline
+     * para el reconocimiento de voz.
+     */
+    fun openVoiceInputSettings(context: Context) {
+        try {
+            val intent = Intent(Settings.ACTION_VOICE_INPUT_SETTINGS).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(intent)
+            Toast.makeText(
+                context,
+                "Ve a: Reconocimiento de voz offline → Español (España)",
+                Toast.LENGTH_LONG
+            ).show()
+        } catch (e: Exception) {
+            // Fallback: abrir los settings generales de la app.
+            try {
+                val intent = Intent(Settings.ACTION_SETTINGS).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(intent)
+            } catch (_: Exception) {
+                Toast.makeText(
+                    context,
+                    "No se pudo abrir la configuración de voz",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        }
+    }
+
+    /**
+     * Abre los detalles de la app en Configuración, donde el usuario
+     * puede revisar/otorgar el permiso de micrófono manualmente.
+     */
+    fun openAppSettings(context: Context) {
+        try {
+            val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                data = android.net.Uri.fromParts("package", context.packageName, null)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(intent)
+        } catch (e: Exception) {
+            Toast.makeText(context, "No se pudo abrir la configuración", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /**
+     * Reinicia el estado de diagnóstico después de que el usuario haya
+     * hecho un cambio (ej: instalar el idioma offline).
+     */
+    fun resetVoiceDiagnostics() {
+        localVoiceManager?.resetDiagnostics()
+        _voiceDiagnostic.value = VoiceDiagnostic()
     }
 
     fun toggleVoiceListening() {

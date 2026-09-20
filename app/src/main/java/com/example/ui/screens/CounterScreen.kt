@@ -56,6 +56,7 @@ fun CounterScreen(
     val audioLevel by viewModel.audioLevel.collectAsStateWithLifecycle()
     val lastPhrase by viewModel.lastSpokenPhrase.collectAsStateWithLifecycle()
     val lastCommandAction by viewModel.lastCommandAction.collectAsStateWithLifecycle()
+    val voiceDiagnostic by viewModel.voiceDiagnostic.collectAsStateWithLifecycle()
     val currentSource by viewModel.currentSource.collectAsStateWithLifecycle()
     val callAlwaysIncrement by viewModel.callAlwaysIncrement.collectAsStateWithLifecycle()
     val recentHistory by viewModel.recentHistory.collectAsStateWithLifecycle()
@@ -64,6 +65,30 @@ fun CounterScreen(
 
     var showHistorySheet by remember { mutableStateOf(false) }
     var showSetDirectDialog by remember { mutableStateOf(false) }
+
+    // Comprobación automática al abrir: si falta el permiso de micrófono,
+    // pedírselo al usuario de inmediato. Sin este permiso, el
+    // reconocimiento de voz lanza error 9 (INSUFFICIENT_PERMISSIONS) en
+    // bucle y la app parece "sorda".
+    val autoPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissionsMap ->
+        // No auto-start voice, solo pedir permiso. El usuario decide
+        // cuándo activar el micrófono con el botón.
+    }
+
+    LaunchedEffect(Unit) {
+        val needed = mutableListOf(Manifest.permission.RECORD_AUDIO)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            needed.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        val missing = needed.filter {
+            ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isNotEmpty()) {
+            autoPermissionLauncher.launch(missing.toTypedArray())
+        }
+    }
 
     // Permission launcher for Microphone and Notification
     val permissionsLauncher = rememberLauncherForActivityResult(
@@ -198,6 +223,15 @@ fun CounterScreen(
                 currentSource = currentSource,
                 onToggleService = { viewModel.toggleBackgroundService(context) },
                 onToggleIncrementSetting = { viewModel.setCallAlwaysIncrement(!callAlwaysIncrement) }
+            )
+
+            // Banner de diagnóstico de voz: aparece cuando hay errores
+            // que requieren acción del usuario (paquete de idioma, permisos, etc.).
+            VoiceDiagnosticBanner(
+                diagnostic = voiceDiagnostic,
+                onOpenVoiceSettings = { viewModel.openVoiceInputSettings(context) },
+                onOpenAppSettings = { viewModel.openAppSettings(context) },
+                onRetry = { viewModel.resetVoiceDiagnostics() }
             )
 
             // Main Counter Display Section
@@ -737,6 +771,149 @@ fun RecentHistorySection(
                             entry = item,
                             onDelete = {}
                         )
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+@Composable
+fun VoiceDiagnosticBanner(
+    diagnostic: com.example.voice.VoiceDiagnostic,
+    onOpenVoiceSettings: () -> Unit,
+    onOpenAppSettings: () -> Unit,
+    onRetry: () -> Unit
+) {
+    // Mostrar banner solo cuando hay algo accionable:
+    //  - needsLanguagePack (error 13)
+    //  - !recognizerAvailable
+    //  - !permissionGranted
+    //  - o 3+ errores consecutivos
+    val show = diagnostic.needsLanguagePack ||
+        !diagnostic.recognizerAvailable ||
+        !diagnostic.permissionGranted ||
+        (diagnostic.consecutiveErrors >= 3 && diagnostic.errorMessage.isNotBlank())
+
+    if (!show) return
+
+    val isCritical = diagnostic.needsLanguagePack ||
+        !diagnostic.recognizerAvailable ||
+        !diagnostic.permissionGranted
+
+    val (title, body, icon) = when {
+        !diagnostic.recognizerAvailable -> Triple(
+            "Motor de voz no instalado",
+            "Tu dispositivo no tiene un servicio de reconocimiento de voz. " +
+                "Instala la app de Google desde Play Store e inténtalo de nuevo.",
+            Icons.Filled.SpeakerNotesOff
+        )
+        !diagnostic.permissionGranted -> Triple(
+            "Permiso de micrófono denegado",
+            "Para usar el dictado por voz, otorga el permiso de micrófono.",
+            Icons.Filled.MicOff
+        )
+        diagnostic.needsLanguagePack -> Triple(
+            "Descarga el idioma español offline",
+            "El reconocimiento offline en español no está disponible en tu dispositivo. " +
+                "Abre Configuración → Teclado en pantalla / Entrada de voz → " +
+                "Reconocimiento de voz offline → Español (España) y descárgalo.",
+            Icons.Filled.Download
+        )
+        else -> Triple(
+            "Problemas de reconocimiento de voz",
+            "Error: ${diagnostic.errorMessage} (código ${diagnostic.errorCode}). " +
+                "Modo actual: ${diagnostic.mode}. " +
+                "Errores consecutivos: ${diagnostic.consecutiveErrors}.",
+            Icons.Filled.Warning
+        )
+    }
+
+    Card(
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = if (isCritical) {
+                MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.7f)
+            } else {
+                MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.7f)
+            }
+        ),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("voice_diagnostic_banner")
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = null,
+                    tint = if (isCritical) {
+                        MaterialTheme.colorScheme.onErrorContainer
+                    } else {
+                        MaterialTheme.colorScheme.onTertiaryContainer
+                    }
+                )
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = if (isCritical) {
+                        MaterialTheme.colorScheme.onErrorContainer
+                    } else {
+                        MaterialTheme.colorScheme.onTertiaryContainer
+                    }
+                )
+            }
+
+            Text(
+                text = body,
+                style = MaterialTheme.typography.bodySmall,
+                color = if (isCritical) {
+                    MaterialTheme.colorScheme.onErrorContainer
+                } else {
+                    MaterialTheme.colorScheme.onTertiaryContainer
+                }
+            )
+
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                when {
+                    !diagnostic.recognizerAvailable -> {
+                        // No hay nada que hacer desde la app; el usuario
+                        // debe instalar Google app desde Play Store.
+                    }
+                    !diagnostic.permissionGranted -> {
+                        Button(
+                            onClick = onOpenAppSettings,
+                            modifier = Modifier.testTag("btn_open_app_settings")
+                        ) {
+                            Text("Otorgar permiso")
+                        }
+                    }
+                    diagnostic.needsLanguagePack -> {
+                        Button(
+                            onClick = onOpenVoiceSettings,
+                            modifier = Modifier.testTag("btn_download_language")
+                        ) {
+                            Text("Descargar idioma español")
+                        }
+                        TextButton(onClick = onRetry) {
+                            Text("Reintentar")
+                        }
+                    }
+                    else -> {
+                        TextButton(onClick = onRetry) {
+                            Text("Reintentar")
+                        }
                     }
                 }
             }

@@ -6,6 +6,7 @@ import android.media.AudioManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -15,6 +16,20 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.util.Locale
+
+/**
+ * Estado del reconocimiento de voz, expuesto a la UI para mostrar
+ * mensajes de diagnóstico accionables (no solo "no funciona").
+ */
+data class VoiceDiagnostic(
+    val errorCode: Int = 0,
+    val errorMessage: String = "",
+    val consecutiveErrors: Int = 0,
+    val needsLanguagePack: Boolean = false,
+    val recognizerAvailable: Boolean = true,
+    val permissionGranted: Boolean = true,
+    val mode: String = "offline-es-ES"  // info para depurar
+)
 
 class VoiceRecognitionManager(
     private val context: Context,
@@ -40,9 +55,36 @@ class VoiceRecognitionManager(
     private val _lastDetectedPhrase = MutableStateFlow("")
     val lastDetectedPhrase: StateFlow<String> = _lastDetectedPhrase.asStateFlow()
 
+    // Diagnóstico para la UI
+    private val _diagnostic = MutableStateFlow(VoiceDiagnostic())
+    val diagnostic: StateFlow<VoiceDiagnostic> = _diagnostic.asStateFlow()
+
     private var shouldKeepListening = false
     private var isCallModeActive = false
     private var callModeAlwaysIncrement = false
+
+    // Estrategia de fallback para el intent: probamos varias combinaciones
+    // (idioma + offline/online) hasta encontrar una que funcione.
+    private data class RecognizerStrategy(
+        val useOffline: Boolean,
+        val language: String,
+        val label: String
+    )
+
+    private val strategies = listOf(
+        RecognizerStrategy(useOffline = true,  language = "es-ES", label = "offline-es-ES"),
+        RecognizerStrategy(useOffline = true,  language = "es-419", label = "offline-es-419"),
+        RecognizerStrategy(useOffline = true,  language = "es-MX", label = "offline-es-MX"),
+        RecognizerStrategy(useOffline = true,  language = "es", label = "offline-es"),
+        RecognizerStrategy(useOffline = false, language = "es-ES", label = "online-es-ES"),
+        RecognizerStrategy(useOffline = false, language = "es-419", label = "online-es-419"),
+        RecognizerStrategy(useOffline = false, language = "es", label = "online-es"),
+        RecognizerStrategy(useOffline = false,
+            language = Locale.getDefault().toLanguageTag(), label = "online-default"),
+        RecognizerStrategy(useOffline = false, language = "en-US", label = "online-en-US")
+    )
+
+    private var currentStrategyIndex = 0
 
     fun setCallModeSettings(alwaysIncrement: Boolean) {
         this.callModeAlwaysIncrement = alwaysIncrement
@@ -51,6 +93,7 @@ class VoiceRecognitionManager(
     fun detectCurrentAudioSource(): String {
         val audioMode = audioManager?.mode ?: AudioManager.MODE_NORMAL
         val isCall = try {
+            @Suppress("DEPRECATION")
             telephonyManager?.callState == TelephonyManager.CALL_STATE_OFFHOOK ||
                     audioMode == AudioManager.MODE_IN_CALL
         } catch (_: Exception) {
@@ -72,8 +115,38 @@ class VoiceRecognitionManager(
 
     fun startListening() {
         shouldKeepListening = true
+        // Reiniciamos la estrategia de fallback en cada inicio.
+        currentStrategyIndex = 0
         mainHandler.post {
             _currentSource.value = detectCurrentAudioSource()
+            // Comprobación previa: ¿está instalado el servicio de reconocimiento?
+            // ¿Tenemos permiso de micrófono?
+            val recognizerAvailable = SpeechRecognizer.isRecognitionAvailable(context)
+            val hasMicPermission = context.checkSelfPermission(
+                android.Manifest.permission.RECORD_AUDIO
+            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+
+            if (!recognizerAvailable) {
+                _diagnostic.value = _diagnostic.value.copy(
+                    recognizerAvailable = false,
+                    errorMessage = "No hay motor de reconocimiento de voz instalado. " +
+                        "Instala la app de Google desde Play Store.",
+                    mode = "no-recognizer"
+                )
+                Log.e("VoiceManager", "SpeechRecognizer.isRecognitionAvailable = false")
+                _isListening.value = false
+                return@post
+            }
+            if (!hasMicPermission) {
+                _diagnostic.value = _diagnostic.value.copy(
+                    permissionGranted = false,
+                    errorMessage = "Falta permiso de micrófono (RECORD_AUDIO).",
+                    mode = "no-permission"
+                )
+                Log.e("VoiceManager", "RECORD_AUDIO permission not granted")
+                _isListening.value = false
+                return@post
+            }
             initRecognizerAndStart()
         }
     }
@@ -95,41 +168,72 @@ class VoiceRecognitionManager(
         }
     }
 
+    /**
+     * Construye el Intent según la estrategia actual.
+     */
+    private fun buildIntent(strategy: RecognizerStrategy): Intent {
+        return Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, strategy.language)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, strategy.language)
+            putExtra(RecognizerIntent.EXTRA_ONLY_RETURN_LANGUAGE_PREFERENCE, false)
+            if (strategy.useOffline) {
+                putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+            }
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+        }
+    }
+
     private fun initRecognizerAndStart() {
         if (!shouldKeepListening) return
 
-        try {
-            speechRecognizer?.destroy()
-        } catch (_: Exception) {}
-
-        if (!SpeechRecognizer.isRecognitionAvailable(context)) {
-            Log.w("VoiceManager", "Speech recognition not available on device")
+        val recognizerAvailable = SpeechRecognizer.isRecognitionAvailable(context)
+        if (!recognizerAvailable) {
             _isListening.value = false
             return
         }
 
         try {
+            speechRecognizer?.destroy()
+        } catch (_: Exception) {}
+
+        // Estrategia actual (con fallback entre strategies)
+        if (currentStrategyIndex >= strategies.size) {
+            currentStrategyIndex = 0
+        }
+        val strategy = strategies[currentStrategyIndex]
+
+        try {
             speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context).apply {
                 setRecognitionListener(createListener())
             }
+            speechRecognizer?.startListening(buildIntent(strategy))
 
-            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE, "es-ES")
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "es-ES")
-                // Offline speech recognition
-                putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
-                putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
-            }
+            // Actualizar diagnóstico con la estrategia actual.
+            _diagnostic.value = _diagnostic.value.copy(
+                mode = strategy.label,
+                recognizerAvailable = true
+            )
 
-            speechRecognizer?.startListening(intent)
             _isListening.value = true
         } catch (e: Exception) {
             Log.e("VoiceManager", "Failed to start listening", e)
             _isListening.value = false
             scheduleRestart()
         }
+    }
+
+    /**
+     * Avanza a la siguiente estrategia de fallback cuando la actual falla
+     * con un error que indica que el idioma/modo no está disponible.
+     */
+    private fun tryNextStrategy(reason: String) {
+        val old = currentStrategyIndex
+        currentStrategyIndex = (currentStrategyIndex + 1) % strategies.size
+        Log.w("VoiceManager",
+            "Cambiando estrategia de reconocimiento: ${strategies[old].label} → " +
+            "${strategies[currentStrategyIndex].label}  ($reason)")
     }
 
     private fun scheduleRestart() {
@@ -142,10 +246,47 @@ class VoiceRecognitionManager(
         }
     }
 
+    private fun scheduleRestartShort() {
+        if (shouldKeepListening) {
+            mainHandler.postDelayed({
+                if (shouldKeepListening) {
+                    initRecognizerAndStart()
+                }
+            }, 1500)
+        }
+    }
+
+    // ============================================================
+    // Traducción de códigos de error de SpeechRecognizer a
+    // mensajes accionables para el usuario.
+    // ============================================================
+    private fun describeError(error: Int): String = when (error) {
+        SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Tiempo de espera de red agotado"
+        SpeechRecognizer.ERROR_NETWORK -> "Sin conexión de red"
+        SpeechRecognizer.ERROR_AUDIO -> "Error de audio"
+        SpeechRecognizer.ERROR_SERVER -> "Error del servidor de reconocimiento"
+        SpeechRecognizer.ERROR_CLIENT -> "Error interno del cliente"
+        SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "No se detectó voz (timeout)"
+        SpeechRecognizer.ERROR_NO_MATCH -> "No se reconoció ninguna palabra"
+        SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Reconocedor ocupado"
+        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Falta permiso de micrófono"
+        11 -> "Servidor desconectado (sin internet o servicio no disponible)"
+        12 -> "Demasiadas peticiones, espera..."
+        13 -> "Idioma español no disponible offline"
+        14 -> "Servicio ocupado, reintentando..."
+        else -> "Error desconocido: $error"
+    }
+
     private fun createListener() = object : RecognitionListener {
         override fun onReadyForSpeech(params: Bundle?) {
             _isListening.value = true
             _currentSource.value = detectCurrentAudioSource()
+            // Resetear contador de errores consecutivos.
+            _diagnostic.value = _diagnostic.value.copy(
+                consecutiveErrors = 0,
+                errorCode = 0,
+                errorMessage = ""
+            )
         }
 
         override fun onBeginningOfSpeech() {
@@ -153,7 +294,6 @@ class VoiceRecognitionManager(
         }
 
         override fun onRmsChanged(rmsdB: Float) {
-            // Normalize roughly from -2dB..10dB to 0..1
             val normalized = ((rmsdB + 2f) / 12f).coerceIn(0f, 1f)
             _audioLevel.value = normalized
         }
@@ -165,18 +305,54 @@ class VoiceRecognitionManager(
         }
 
         override fun onError(error: Int) {
-            Log.d("VoiceManager", "SpeechRecognizer error: $error")
+            val msg = describeError(error)
+            Log.d("VoiceManager", "SpeechRecognizer error: $error  ($msg)  " +
+                "estrategia=${strategies[currentStrategyIndex].label}")
+
+            val consecutive = _diagnostic.value.consecutiveErrors + 1
+
+            // Detectar específicamente error 13 (idioma offline no disponible).
+            val needsLangPack = error == 13 || (consecutive >= 3 && error == 11)
+
+            _diagnostic.value = _diagnostic.value.copy(
+                errorCode = error,
+                errorMessage = msg,
+                consecutiveErrors = consecutive,
+                needsLanguagePack = needsLangPack,
+                mode = strategies[currentStrategyIndex].label
+            )
+
             _audioLevel.value = 0f
-            scheduleRestart()
+
+            // Estrategia de fallback:
+            //  - Error 13 (idioma offline no disponible) → cambiar estrategia.
+            //  - Error 11 (servidor desconectado) → cambiar estrategia.
+            //  - Error 9 (permisos) → no reintentar, el usuario debe otorgar permiso.
+            //  - Otros → solo reintentar.
+            when (error) {
+                SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
+                    shouldKeepListening = false
+                    _isListening.value = false
+                    return
+                }
+                13, 11 -> {
+                    tryNextStrategy("error=$error")
+                    scheduleRestartShort()
+                }
+                else -> {
+                    // Si ya llevamos varios errores seguidos, también probamos
+                    // otra estrategia antes de seguir reintentando ciegamente.
+                    if (consecutive >= 5) {
+                        tryNextStrategy("consecutive=$consecutive")
+                    }
+                    scheduleRestart()
+                }
+            }
         }
 
         override fun onResults(results: Bundle?) {
             val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
             if (!matches.isNullOrEmpty()) {
-                // El reconocedor devuelve hasta N alternativas (EXTRA_MAX_RESULTS=3).
-                // Probarlas en orden; la primera que produzca un comando válido gana.
-                // Si NINGUNA produce comando, guardamos la primera como "frase
-                // reconocida sin comando" para feedback del usuario.
                 var firstPhrase = matches[0]
                 var matched = false
 
@@ -186,7 +362,6 @@ class VoiceRecognitionManager(
                         callModeAlwaysIncrement = callModeAlwaysIncrement
                     )
                     if (cmd !is VoiceCommand.None) {
-                        // ¡Encontramos un comando válido en una alternativa!
                         processRecognizedSpeech(phrase)
                         matched = true
                         break
@@ -194,13 +369,18 @@ class VoiceRecognitionManager(
                 }
 
                 if (!matched) {
-                    // Ninguna alternativa fue un comando. Mostrar la primera
-                    // para que el usuario vea qué escuchó la app y pueda
-                    // corregir su pronunciación.
                     _lastDetectedPhrase.value = firstPhrase
                     _partialText.value = firstPhrase
                     Log.d("VoiceManager", "Frase sin comando reconocida: $firstPhrase")
                 }
+
+                // Resetear errores consecutivos porque sí se obtuvo un resultado.
+                _diagnostic.value = _diagnostic.value.copy(
+                    consecutiveErrors = 0,
+                    errorCode = 0,
+                    errorMessage = "",
+                    needsLanguagePack = false
+                )
             }
             scheduleRestart()
         }
@@ -226,5 +406,14 @@ class VoiceRecognitionManager(
         if (command !is VoiceCommand.None) {
             onCommandDetected(command, phrase, source)
         }
+    }
+
+    /**
+     * Resetea el contador de errores consecutivos (cuando el usuario
+     * resuelve manualmente el problema y quiere reintentar).
+     */
+    fun resetDiagnostics() {
+        _diagnostic.value = VoiceDiagnostic()
+        currentStrategyIndex = 0
     }
 }
